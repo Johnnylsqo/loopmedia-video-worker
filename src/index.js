@@ -1,11 +1,11 @@
-import express from "express"
-import os from "os"
-import fs from "fs"
-import fsp from "fs/promises"
-import path from "path"
-import { pipeline } from "stream/promises"
-import { spawn } from "child_process"
-import { createClient } from "@supabase/supabase-js"
+import express from "express";
+import os from "os";
+import fs from "fs";
+import fsp from "fs/promises";
+import path from "path";
+import { pipeline } from "stream/promises";
+import { spawn } from "child_process";
+import { createClient } from "@supabase/supabase-js";
 
 const {
   PORT = "3000",
@@ -15,38 +15,46 @@ const {
   WORKER_ID = `worker-${os.hostname()}`,
   POLL_INTERVAL_MS = "5000",
   TEMP_DIR = "/tmp/loopmedia",
-  FFMPEG_CRF = "30",
-  FFMPEG_PRESET = "ultrafast",
+  FFMPEG_CRF = "23",
+  FFMPEG_PRESET = "veryfast",
   MAX_JOB_ATTEMPTS = "3",
   MAX_INPUT_SIZE_BYTES = "2147483648",
   MAX_OUTPUT_WIDTH = "1920",
   MAX_OUTPUT_HEIGHT = "1080",
+  MAX_OUTPUT_FPS = "30",
+  FFMPEG_VIDEO_PROFILE = "main",
+  FFMPEG_VIDEO_LEVEL = "4.0",
+  FFMPEG_MAXRATE = "5M",
+  FFMPEG_BUFSIZE = "10M",
+  FFMPEG_AUDIO_BITRATE = "160k",
+  FFMPEG_AUDIO_RATE = "48000",
+  FFMPEG_AUDIO_CHANNELS = "2",
   STALE_REQUEUE_MINUTES = "30",
   REQUEUE_CHECK_EVERY_LOOPS = "12"
-} = process.env
+} = process.env;
 
 function validateEnv() {
   const required = [
     "SUPABASE_URL",
     "SUPABASE_SERVICE_ROLE_KEY",
     "SUPABASE_STORAGE_BUCKET"
-  ]
+  ];
 
-  const missing = required.filter((key) => !process.env[key])
+  const missing = required.filter((key) => !process.env[key]);
 
   if (missing.length > 0) {
-    console.error("[startup] Missing required env vars:", missing.join(", "))
-    process.exit(1)
+    console.error("[startup] Missing required env vars:", missing.join(", "));
+    process.exit(1);
   }
 }
 
-validateEnv()
+validateEnv();
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false }
-})
+});
 
-const app = express()
+const app = express();
 
 app.get("/health", (_req, res) => {
   res.status(200).json({
@@ -55,23 +63,23 @@ app.get("/health", (_req, res) => {
     bucket: SUPABASE_STORAGE_BUCKET,
     uptimeSeconds: Math.floor(process.uptime()),
     time: new Date().toISOString()
-  })
-})
+  });
+});
 
 app.listen(Number(PORT), () => {
-  console.log(`[http] Worker health server running on port ${PORT}`)
-})
+  console.log(`[http] Worker health server running on port ${PORT}`);
+});
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function ensureDir(dirPath) {
-  await fsp.mkdir(dirPath, { recursive: true })
+  await fsp.mkdir(dirPath, { recursive: true });
 }
 
 function safeString(value) {
-  return String(value || "").trim()
+  return String(value || "").trim();
 }
 
 function runProcess(command, args, options = {}) {
@@ -79,38 +87,38 @@ function runProcess(command, args, options = {}) {
     const child = spawn(command, args, {
       stdio: ["ignore", "pipe", "pipe"],
       ...options
-    })
+    });
 
-    let stdout = ""
-    let stderr = ""
+    let stdout = "";
+    let stderr = "";
 
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString()
-    })
+      stdout += chunk.toString();
+    });
 
     child.stderr.on("data", (chunk) => {
-      const text = chunk.toString()
-      stderr += text
-      process.stdout.write(`[${command}] ${text}`)
-    })
+      const text = chunk.toString();
+      stderr += text;
+      process.stdout.write(`[${command}] ${text}`);
+    });
 
     child.on("error", (err) => {
-      reject(err)
-    })
+      reject(err);
+    });
 
     child.on("close", (code) => {
       if (code === 0) {
-        resolve({ stdout, stderr })
-        return
+        resolve({ stdout, stderr });
+        return;
       }
 
-      reject(new Error(`${command} exited with code ${code}\n${stderr || stdout}`))
-    })
-  })
+      reject(new Error(`${command} exited with code ${code}\n${stderr || stdout}`));
+    });
+  });
 }
 
 async function ffprobeFile(inputPath) {
-  console.log(`[ffprobe] start ${inputPath}`)
+  console.log(`[ffprobe] start ${inputPath}`);
 
   const args = [
     "-v", "error",
@@ -118,14 +126,14 @@ async function ffprobeFile(inputPath) {
     "-show_streams",
     "-show_format",
     inputPath
-  ]
+  ];
 
-  const { stdout } = await runProcess("ffprobe", args)
-  const parsed = JSON.parse(stdout)
+  const { stdout } = await runProcess("ffprobe", args);
+  const parsed = JSON.parse(stdout);
 
-  const videoStream = (parsed.streams || []).find((s) => s.codec_type === "video")
-  const audioStream = (parsed.streams || []).find((s) => s.codec_type === "audio")
-  const format = parsed.format || {}
+  const videoStream = (parsed.streams || []).find((s) => s.codec_type === "video");
+  const audioStream = (parsed.streams || []).find((s) => s.codec_type === "audio");
+  const format = parsed.format || {};
 
   const metadata = {
     durationSeconds: format.duration ? Math.round(Number(format.duration)) : null,
@@ -135,89 +143,94 @@ async function ffprobeFile(inputPath) {
     audioCodec: safeString(audioStream?.codec_name).toLowerCase(),
     pixelFormat: safeString(videoStream?.pix_fmt).toLowerCase(),
     formatName: safeString(format.format_name).toLowerCase(),
-    bitRate: format.bit_rate ? Number(format.bit_rate) : null
-  }
+    bitRate: format.bit_rate ? Number(format.bit_rate) : null,
+    avgFrameRate: safeString(videoStream?.avg_frame_rate),
+    sampleRate: audioStream?.sample_rate ? Number(audioStream.sample_rate) : null,
+    channels: audioStream?.channels ?? null
+  };
 
-  console.log(`[ffprobe] done ${JSON.stringify(metadata)}`)
-  return metadata
+  console.log(`[ffprobe] done ${JSON.stringify(metadata)}`);
+  return metadata;
 }
 
 async function downloadFromStorageToFile(storagePath, destinationPath) {
-  console.log(`[download] start bucket=${SUPABASE_STORAGE_BUCKET} path=${storagePath}`)
+  console.log(`[download] start bucket=${SUPABASE_STORAGE_BUCKET} path=${storagePath}`);
 
   const { data, error } = await supabase
     .storage
     .from(SUPABASE_STORAGE_BUCKET)
-    .createSignedUrl(storagePath, 3600)
+    .createSignedUrl(storagePath, 3600);
 
   if (error) {
     throw new Error(
       `createSignedUrl failed for bucket="${SUPABASE_STORAGE_BUCKET}" path="${storagePath}": ${error.message}`
-    )
+    );
   }
 
   if (!data || !data.signedUrl) {
     throw new Error(
       `createSignedUrl returned no signedUrl for bucket="${SUPABASE_STORAGE_BUCKET}" path="${storagePath}"`
-    )
+    );
   }
 
-  const response = await fetch(data.signedUrl)
+  const response = await fetch(data.signedUrl);
 
   if (!response.ok) {
     throw new Error(
       `download failed for bucket="${SUPABASE_STORAGE_BUCKET}" path="${storagePath}" with status ${response.status}`
-    )
+    );
   }
 
   if (!response.body) {
     throw new Error(
       `download returned empty body for bucket="${SUPABASE_STORAGE_BUCKET}" path="${storagePath}"`
-    )
+    );
   }
 
-  const writeStream = fs.createWriteStream(destinationPath)
-  await pipeline(response.body, writeStream)
+  const writeStream = fs.createWriteStream(destinationPath);
+  await pipeline(response.body, writeStream);
 
-  const stats = await fsp.stat(destinationPath)
-  console.log(`[download] done ${destinationPath} (${stats.size} bytes)`)
+  const stats = await fsp.stat(destinationPath);
+  console.log(`[download] done ${destinationPath} (${stats.size} bytes)`);
 
-  return stats.size
+  return stats.size;
 }
 
 async function uploadFileToStorage(localPath, outputPath) {
-  console.log(`[upload] start local=${localPath} output=${outputPath}`)
+  console.log(`[upload] start local=${localPath} output=${outputPath}`);
 
-  const readStream = fs.createReadStream(localPath)
+  const fileBuffer = await fsp.readFile(localPath);
 
   const { error } = await supabase
     .storage
     .from(SUPABASE_STORAGE_BUCKET)
-    .upload(outputPath, readStream, {
+    .upload(outputPath, fileBuffer, {
       contentType: "video/mp4",
       upsert: true
-    })
+    });
 
   if (error) {
-    throw new Error(`upload failed for output="${outputPath}": ${error.message}`)
+    throw new Error(`upload failed for output="${outputPath}": ${error.message}`);
   }
 
-  const stats = await fsp.stat(localPath)
-  console.log(`[upload] done ${outputPath} (${stats.size} bytes)`)
+  const stats = await fsp.stat(localPath);
+  console.log(`[upload] done ${outputPath} (${stats.size} bytes)`);
 
-  return stats.size
+  return stats.size;
 }
 
 function isAlreadyCompatible(metadata) {
-  const maxWidth = Number(MAX_OUTPUT_WIDTH)
-  const maxHeight = Number(MAX_OUTPUT_HEIGHT)
+  const maxWidth = Number(MAX_OUTPUT_WIDTH);
+  const maxHeight = Number(MAX_OUTPUT_HEIGHT);
 
-  const isMp4 = metadata.formatName.includes("mp4")
-  const isH264 = metadata.videoCodec === "h264"
-  const isAacOrNoAudio = metadata.audioCodec === "aac" || metadata.audioCodec === ""
-  const isYuv420p = metadata.pixelFormat === "yuv420p" || metadata.pixelFormat === ""
-  const withinWidth = !metadata.width || metadata.width <= maxWidth
-  const withinHeight = !metadata.height || metadata.height <= maxHeight
+  const isMp4 = metadata.formatName.includes("mp4");
+  const isH264 = metadata.videoCodec === "h264";
+  const isAacOrNoAudio = metadata.audioCodec === "aac" || metadata.audioCodec === "";
+  const isYuv420p = metadata.pixelFormat === "yuv420p" || metadata.pixelFormat === "";
+  const withinWidth = !metadata.width || metadata.width <= maxWidth;
+  const withinHeight = !metadata.height || metadata.height <= maxHeight;
+  const stereoOrNoAudio = !metadata.channels || metadata.channels <= 2;
+  const audioRateOk = !metadata.sampleRate || metadata.sampleRate === Number(FFMPEG_AUDIO_RATE);
 
   return (
     isMp4 &&
@@ -225,67 +238,88 @@ function isAlreadyCompatible(metadata) {
     isAacOrNoAudio &&
     isYuv420p &&
     withinWidth &&
-    withinHeight
-  )
+    withinHeight &&
+    stereoOrNoAudio &&
+    audioRateOk
+  );
 }
 
 async function copyCompatibleVideo(inputPath, outputPath) {
-  console.log(`[copy] video already compatible, copying ${inputPath} -> ${outputPath}`)
-  await fsp.copyFile(inputPath, outputPath)
-  const stats = await fsp.stat(outputPath)
-  console.log(`[copy] done ${outputPath} (${stats.size} bytes)`)
-  return stats.size
+  console.log(`[copy] video already compatible, copying ${inputPath} -> ${outputPath}`);
+  await fsp.copyFile(inputPath, outputPath);
+  const stats = await fsp.stat(outputPath);
+  console.log(`[copy] done ${outputPath} (${stats.size} bytes)`);
+  return stats.size;
 }
 
 async function runTranscode(inputPath, outputPath) {
-  console.log(`[ffmpeg] start ${inputPath} -> ${outputPath}`)
+  console.log(`[ffmpeg] start ${inputPath} -> ${outputPath}`);
 
-  const scaleFilter = `scale='min(${MAX_OUTPUT_WIDTH},iw)':'min(${MAX_OUTPUT_HEIGHT},ih)':force_original_aspect_ratio=decrease`
+  const scaleFilter = `scale='min(${MAX_OUTPUT_WIDTH},iw)':'min(${MAX_OUTPUT_HEIGHT},ih)':force_original_aspect_ratio=decrease,fps=${MAX_OUTPUT_FPS}`;
 
-  await runProcess("ffmpeg", [
+  const args = [
     "-y",
+    "-hide_banner",
     "-i", inputPath,
     "-vf", scaleFilter,
     "-c:v", "libx264",
+    "-profile:v", FFMPEG_VIDEO_PROFILE,
+    "-level:v", FFMPEG_VIDEO_LEVEL,
     "-preset", FFMPEG_PRESET,
     "-crf", FFMPEG_CRF,
     "-pix_fmt", "yuv420p",
     "-movflags", "+faststart",
-    "-threads", "1",
+    "-maxrate", FFMPEG_MAXRATE,
+    "-bufsize", FFMPEG_BUFSIZE,
     "-c:a", "aac",
-    "-b:a", "128k",
+    "-ar", FFMPEG_AUDIO_RATE,
+    "-ac", FFMPEG_AUDIO_CHANNELS,
+    "-b:a", FFMPEG_AUDIO_BITRATE,
     outputPath
-  ])
+  ];
 
-  const stats = await fsp.stat(outputPath)
-  console.log(`[ffmpeg] done ${outputPath} (${stats.size} bytes)`)
+  console.log(`[ffmpeg] command: ffmpeg ${args.join(" ")}`);
 
-  return stats.size
+  await runProcess("ffmpeg", args);
+
+  const stats = await fsp.stat(outputPath);
+  console.log(`[ffmpeg] done ${outputPath} (${stats.size} bytes)`);
+
+  const finalProbe = await ffprobeFile(outputPath);
+  console.log(
+    `[ffmpeg] final metadata codec=${finalProbe.videoCodec}/${finalProbe.audioCodec} ` +
+    `resolution=${finalProbe.width}x${finalProbe.height} duration=${finalProbe.durationSeconds}s`
+  );
+
+  return {
+    outputSize: stats.size,
+    finalMetadata: finalProbe
+  };
 }
 
 async function claimJob() {
   const { data, error } = await supabase.rpc("claim_video_job", {
     worker_name: WORKER_ID
-  })
+  });
 
   if (error) {
-    throw new Error(`claim_video_job failed: ${error.message}`)
+    throw new Error(`claim_video_job failed: ${error.message}`);
   }
 
-  if (!data) return null
-  return Array.isArray(data) ? data[0] ?? null : data
+  if (!data) return null;
+  return Array.isArray(data) ? data[0] ?? null : data;
 }
 
 async function failJob(id, message) {
-  const safeMessage = String(message || "unknown error").slice(0, 5000)
+  const safeMessage = String(message || "unknown error").slice(0, 5000);
 
   const { error } = await supabase.rpc("fail_video_job", {
     job_id: id,
     error: safeMessage
-  })
+  });
 
   if (error) {
-    console.error(`[job ${id}] fail_video_job error: ${error.message}`)
+    console.error(`[job ${id}] fail_video_job error: ${error.message}`);
   }
 }
 
@@ -294,10 +328,10 @@ async function completeJob(id, outputPath, size) {
     job_id: id,
     output_path: outputPath,
     output_size: size
-  })
+  });
 
   if (error) {
-    throw new Error(`complete_video_job failed: ${error.message}`)
+    throw new Error(`complete_video_job failed: ${error.message}`);
   }
 }
 
@@ -310,124 +344,140 @@ async function updateMetadata(jobId, metadata, inputSize) {
       video_height: metadata.height,
       input_size_bytes: inputSize
     })
-    .eq("id", jobId)
+    .eq("id", jobId);
 
   if (error) {
-    console.error(`[job ${jobId}] metadata update failed: ${error.message}`)
+    console.error(`[job ${jobId}] metadata update failed: ${error.message}`);
   }
 }
 
 async function requeueStaleJobs() {
-  console.log(`[requeue] checking stale jobs older than ${STALE_REQUEUE_MINUTES} minutes`)
+  console.log(`[requeue] checking stale jobs older than ${STALE_REQUEUE_MINUTES} minutes`);
 
   const { data, error } = await supabase.rpc("requeue_stale_video_jobs", {
     stale_minutes: Number(STALE_REQUEUE_MINUTES)
-  })
+  });
 
   if (error) {
-    console.error(`[requeue] error: ${error.message}`)
-    return
+    console.error(`[requeue] error: ${error.message}`);
+    return;
   }
 
-  console.log(`[requeue] done, jobs moved back to pending: ${data ?? 0}`)
+  console.log(`[requeue] done, jobs moved back to pending: ${data ?? 0}`);
 }
 
 function buildOutputStoragePath(job) {
-  const videoId = safeString(job.video_id) || "unknown-video"
-  return `processed/${videoId}/${job.id}.mp4`
+  const videoId = safeString(job.video_id) || "unknown-video";
+  return `processed/${videoId}/${job.id}.mp4`;
 }
 
 async function processJob(job) {
-  const jobId = job.id
-  const originalPath = job.original_path
-  const attempts = Number(job.attempts || 0)
+  const jobId = job.id;
+  const originalPath = job.original_path;
+  const attempts = Number(job.attempts || 0);
 
-  console.log(`[job ${jobId}] claimed`)
-  console.log(`[job ${jobId}] original_path=${originalPath}`)
-  console.log(`[job ${jobId}] bucket=${SUPABASE_STORAGE_BUCKET}`)
-  console.log(`[job ${jobId}] attempts=${attempts}`)
-  console.log(`[job ${jobId}] video_id=${job.video_id}`)
+  console.log(`[job ${jobId}] claimed`);
+  console.log(`[job ${jobId}] original_path=${originalPath}`);
+  console.log(`[job ${jobId}] bucket=${SUPABASE_STORAGE_BUCKET}`);
+  console.log(`[job ${jobId}] attempts=${attempts}`);
+  console.log(`[job ${jobId}] video_id=${job.video_id}`);
 
   if (attempts > Number(MAX_JOB_ATTEMPTS)) {
-    throw new Error(`max attempts exceeded (${attempts})`)
+    throw new Error(`max attempts exceeded (${attempts})`);
   }
 
-  const tempDir = path.join(TEMP_DIR, jobId)
-  await ensureDir(tempDir)
+  const tempDir = path.join(TEMP_DIR, jobId);
+  await ensureDir(tempDir);
 
-  const inputPath = path.join(tempDir, "input")
-  const outputPath = path.join(tempDir, "output.mp4")
-  const outputStoragePath = buildOutputStoragePath(job)
+  const inputPath = path.join(tempDir, "input");
+  const outputPath = path.join(tempDir, "output.mp4");
+  const outputStoragePath = buildOutputStoragePath(job);
 
   try {
-    const inputSize = await downloadFromStorageToFile(originalPath, inputPath)
+    const inputSize = await downloadFromStorageToFile(originalPath, inputPath);
 
     if (inputSize > Number(MAX_INPUT_SIZE_BYTES)) {
       throw new Error(
         `input file too large: ${inputSize} bytes (limit ${MAX_INPUT_SIZE_BYTES})`
-      )
+      );
     }
 
-    const metadata = await ffprobeFile(inputPath)
-    await updateMetadata(jobId, metadata, inputSize)
+    const inputMetadata = await ffprobeFile(inputPath);
+    await updateMetadata(jobId, inputMetadata, inputSize);
 
-    let outputSize = 0
+    let outputSize = 0;
+    let outputMetadata = inputMetadata;
 
-    if (isAlreadyCompatible(metadata)) {
-      outputSize = await copyCompatibleVideo(inputPath, outputPath)
+    if (isAlreadyCompatible(inputMetadata)) {
+      outputSize = await copyCompatibleVideo(inputPath, outputPath);
     } else {
-      outputSize = await runTranscode(inputPath, outputPath)
+      const transcodeResult = await runTranscode(inputPath, outputPath);
+      outputSize = transcodeResult.outputSize;
+      outputMetadata = transcodeResult.finalMetadata;
     }
 
-    await uploadFileToStorage(outputPath, outputStoragePath)
-    await completeJob(jobId, outputStoragePath, outputSize)
+    await uploadFileToStorage(outputPath, outputStoragePath);
 
-    console.log(`[job ${jobId}] completed`)
+    if (
+      outputMetadata &&
+      (outputMetadata.durationSeconds !== inputMetadata.durationSeconds ||
+        outputMetadata.width !== inputMetadata.width ||
+        outputMetadata.height !== inputMetadata.height)
+    ) {
+      await updateMetadata(jobId, outputMetadata, inputSize);
+    }
+
+    await completeJob(jobId, outputStoragePath, outputSize);
+
+    console.log(`[job ${jobId}] completed`);
   } catch (err) {
-    console.error(`[job ${jobId}] failed`, err)
-    await failJob(jobId, err.stack || err.message || String(err))
+    console.error(`[job ${jobId}] failed`, err);
+    await failJob(jobId, err.stack || err.message || String(err));
   } finally {
-    await fsp.rm(tempDir, { recursive: true, force: true })
+    await fsp.rm(tempDir, { recursive: true, force: true });
   }
 }
 
 async function workerLoop() {
-  await ensureDir(TEMP_DIR)
+  await ensureDir(TEMP_DIR);
 
-  console.log(`[worker] started`)
-  console.log(`[worker] id=${WORKER_ID}`)
-  console.log(`[worker] bucket=${SUPABASE_STORAGE_BUCKET}`)
-  console.log(`[worker] poll_interval_ms=${POLL_INTERVAL_MS}`)
-  console.log(`[worker] max_input_size_bytes=${MAX_INPUT_SIZE_BYTES}`)
-  console.log(`[worker] max_output=${MAX_OUTPUT_WIDTH}x${MAX_OUTPUT_HEIGHT}`)
-  console.log(`[worker] stale_requeue_minutes=${STALE_REQUEUE_MINUTES}`)
+  console.log(`[worker] started`);
+  console.log(`[worker] id=${WORKER_ID}`);
+  console.log(`[worker] bucket=${SUPABASE_STORAGE_BUCKET}`);
+  console.log(`[worker] poll_interval_ms=${POLL_INTERVAL_MS}`);
+  console.log(`[worker] max_input_size_bytes=${MAX_INPUT_SIZE_BYTES}`);
+  console.log(`[worker] max_output=${MAX_OUTPUT_WIDTH}x${MAX_OUTPUT_HEIGHT}@${MAX_OUTPUT_FPS}fps`);
+  console.log(`[worker] video_profile=${FFMPEG_VIDEO_PROFILE} level=${FFMPEG_VIDEO_LEVEL}`);
+  console.log(`[worker] maxrate=${FFMPEG_MAXRATE} bufsize=${FFMPEG_BUFSIZE}`);
+  console.log(`[worker] audio=${FFMPEG_AUDIO_RATE}Hz ${FFMPEG_AUDIO_CHANNELS}ch ${FFMPEG_AUDIO_BITRATE}`);
+  console.log(`[worker] stale_requeue_minutes=${STALE_REQUEUE_MINUTES}`);
 
-  let loopCount = 0
+  let loopCount = 0;
 
   while (true) {
     try {
-      loopCount += 1
+      loopCount += 1;
 
       if (loopCount % Number(REQUEUE_CHECK_EVERY_LOOPS) === 0) {
-        await requeueStaleJobs()
+        await requeueStaleJobs();
       }
 
-      const job = await claimJob()
+      const job = await claimJob();
 
       if (!job) {
-        await sleep(Number(POLL_INTERVAL_MS))
-        continue
+        await sleep(Number(POLL_INTERVAL_MS));
+        continue;
       }
 
-      await processJob(job)
+      await processJob(job);
     } catch (err) {
-      console.error("[worker] loop error", err)
-      await sleep(Number(POLL_INTERVAL_MS))
+      console.error("[worker] loop error", err);
+      await sleep(Number(POLL_INTERVAL_MS));
     }
   }
 }
 
 workerLoop().catch((err) => {
-  console.error("[fatal] worker crashed", err)
-  process.exit(1)
-})
+  console.error("[fatal] worker crashed", err);
+  process.exit(1);
+});
