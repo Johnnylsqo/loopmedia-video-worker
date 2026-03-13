@@ -1,1 +1,13 @@
-{ "name": "loopmedia-video-worker", "version": "1.0.0", "private": true, "type": "module", "scripts": { "start": "node src/index.js" }, "dependencies": { "@supabase/supabase-js": "^2.45.0", "express": "^4.19.2" } }
+{
+  "name": "loopmedia-video-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.56.0",
+    "express": "^4.21.2"
+  }
+}
