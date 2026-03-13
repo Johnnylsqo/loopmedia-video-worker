@@ -17,7 +17,12 @@ const {
   TEMP_DIR = "/tmp/loopmedia",
   FFMPEG_CRF = "30",
   FFMPEG_PRESET = "ultrafast",
-  MAX_JOB_ATTEMPTS = "3"
+  MAX_JOB_ATTEMPTS = "3",
+  MAX_INPUT_SIZE_BYTES = "2147483648",
+  MAX_OUTPUT_WIDTH = "1920",
+  MAX_OUTPUT_HEIGHT = "1080",
+  STALE_REQUEUE_MINUTES = "30",
+  REQUEUE_CHECK_EVERY_LOOPS = "12"
 } = process.env
 
 function validateEnv() {
@@ -63,6 +68,10 @@ function sleep(ms) {
 
 async function ensureDir(dirPath) {
   await fsp.mkdir(dirPath, { recursive: true })
+}
+
+function safeString(value) {
+  return String(value || "").trim()
 }
 
 function runProcess(command, args, options = {}) {
@@ -115,12 +124,18 @@ async function ffprobeFile(inputPath) {
   const parsed = JSON.parse(stdout)
 
   const videoStream = (parsed.streams || []).find((s) => s.codec_type === "video")
+  const audioStream = (parsed.streams || []).find((s) => s.codec_type === "audio")
   const format = parsed.format || {}
 
   const metadata = {
     durationSeconds: format.duration ? Math.round(Number(format.duration)) : null,
     width: videoStream?.width ?? null,
-    height: videoStream?.height ?? null
+    height: videoStream?.height ?? null,
+    videoCodec: safeString(videoStream?.codec_name).toLowerCase(),
+    audioCodec: safeString(audioStream?.codec_name).toLowerCase(),
+    pixelFormat: safeString(videoStream?.pix_fmt).toLowerCase(),
+    formatName: safeString(format.format_name).toLowerCase(),
+    bitRate: format.bit_rate ? Number(format.bit_rate) : null
   }
 
   console.log(`[ffprobe] done ${JSON.stringify(metadata)}`)
@@ -193,12 +208,44 @@ async function uploadFileToStorage(localPath, outputPath) {
   return stats.size
 }
 
+function isAlreadyCompatible(metadata) {
+  const maxWidth = Number(MAX_OUTPUT_WIDTH)
+  const maxHeight = Number(MAX_OUTPUT_HEIGHT)
+
+  const isMp4 = metadata.formatName.includes("mp4")
+  const isH264 = metadata.videoCodec === "h264"
+  const isAacOrNoAudio = metadata.audioCodec === "aac" || metadata.audioCodec === ""
+  const isYuv420p = metadata.pixelFormat === "yuv420p" || metadata.pixelFormat === ""
+  const withinWidth = !metadata.width || metadata.width <= maxWidth
+  const withinHeight = !metadata.height || metadata.height <= maxHeight
+
+  return (
+    isMp4 &&
+    isH264 &&
+    isAacOrNoAudio &&
+    isYuv420p &&
+    withinWidth &&
+    withinHeight
+  )
+}
+
+async function copyCompatibleVideo(inputPath, outputPath) {
+  console.log(`[copy] video already compatible, copying ${inputPath} -> ${outputPath}`)
+  await fsp.copyFile(inputPath, outputPath)
+  const stats = await fsp.stat(outputPath)
+  console.log(`[copy] done ${outputPath} (${stats.size} bytes)`)
+  return stats.size
+}
+
 async function runTranscode(inputPath, outputPath) {
   console.log(`[ffmpeg] start ${inputPath} -> ${outputPath}`)
+
+  const scaleFilter = `scale='min(${MAX_OUTPUT_WIDTH},iw)':'min(${MAX_OUTPUT_HEIGHT},ih)':force_original_aspect_ratio=decrease`
 
   await runProcess("ffmpeg", [
     "-y",
     "-i", inputPath,
+    "-vf", scaleFilter,
     "-c:v", "libx264",
     "-preset", FFMPEG_PRESET,
     "-crf", FFMPEG_CRF,
@@ -270,6 +317,26 @@ async function updateMetadata(jobId, metadata, inputSize) {
   }
 }
 
+async function requeueStaleJobs() {
+  console.log(`[requeue] checking stale jobs older than ${STALE_REQUEUE_MINUTES} minutes`)
+
+  const { data, error } = await supabase.rpc("requeue_stale_video_jobs", {
+    stale_minutes: Number(STALE_REQUEUE_MINUTES)
+  })
+
+  if (error) {
+    console.error(`[requeue] error: ${error.message}`)
+    return
+  }
+
+  console.log(`[requeue] done, jobs moved back to pending: ${data ?? 0}`)
+}
+
+function buildOutputStoragePath(job) {
+  const videoId = safeString(job.video_id) || "unknown-video"
+  return `processed/${videoId}/${job.id}.mp4`
+}
+
 async function processJob(job) {
   const jobId = job.id
   const originalPath = job.original_path
@@ -279,6 +346,7 @@ async function processJob(job) {
   console.log(`[job ${jobId}] original_path=${originalPath}`)
   console.log(`[job ${jobId}] bucket=${SUPABASE_STORAGE_BUCKET}`)
   console.log(`[job ${jobId}] attempts=${attempts}`)
+  console.log(`[job ${jobId}] video_id=${job.video_id}`)
 
   if (attempts > Number(MAX_JOB_ATTEMPTS)) {
     throw new Error(`max attempts exceeded (${attempts})`)
@@ -289,17 +357,29 @@ async function processJob(job) {
 
   const inputPath = path.join(tempDir, "input")
   const outputPath = path.join(tempDir, "output.mp4")
-  const outputStoragePath = `processed/${jobId}.mp4`
+  const outputStoragePath = buildOutputStoragePath(job)
 
   try {
     const inputSize = await downloadFromStorageToFile(originalPath, inputPath)
-    const metadata = await ffprobeFile(inputPath)
 
+    if (inputSize > Number(MAX_INPUT_SIZE_BYTES)) {
+      throw new Error(
+        `input file too large: ${inputSize} bytes (limit ${MAX_INPUT_SIZE_BYTES})`
+      )
+    }
+
+    const metadata = await ffprobeFile(inputPath)
     await updateMetadata(jobId, metadata, inputSize)
 
-    const outputSize = await runTranscode(inputPath, outputPath)
-    await uploadFileToStorage(outputPath, outputStoragePath)
+    let outputSize = 0
 
+    if (isAlreadyCompatible(metadata)) {
+      outputSize = await copyCompatibleVideo(inputPath, outputPath)
+    } else {
+      outputSize = await runTranscode(inputPath, outputPath)
+    }
+
+    await uploadFileToStorage(outputPath, outputStoragePath)
     await completeJob(jobId, outputStoragePath, outputSize)
 
     console.log(`[job ${jobId}] completed`)
@@ -318,9 +398,20 @@ async function workerLoop() {
   console.log(`[worker] id=${WORKER_ID}`)
   console.log(`[worker] bucket=${SUPABASE_STORAGE_BUCKET}`)
   console.log(`[worker] poll_interval_ms=${POLL_INTERVAL_MS}`)
+  console.log(`[worker] max_input_size_bytes=${MAX_INPUT_SIZE_BYTES}`)
+  console.log(`[worker] max_output=${MAX_OUTPUT_WIDTH}x${MAX_OUTPUT_HEIGHT}`)
+  console.log(`[worker] stale_requeue_minutes=${STALE_REQUEUE_MINUTES}`)
+
+  let loopCount = 0
 
   while (true) {
     try {
+      loopCount += 1
+
+      if (loopCount % Number(REQUEUE_CHECK_EVERY_LOOPS) === 0) {
+        await requeueStaleJobs()
+      }
+
       const job = await claimJob()
 
       if (!job) {
